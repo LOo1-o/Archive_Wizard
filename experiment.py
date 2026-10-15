@@ -18,6 +18,7 @@ import tkinter as tk
 import traceback
 from tkinter import filedialog, messagebox, ttk
 import re
+import math
 
 from openpyxl.worksheet.page import PageMargins
 from openpyxl.worksheet.properties import PageSetupProperties
@@ -30,7 +31,7 @@ import win32com.client as win32
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter, column_index_from_string
 from openpyxl.worksheet.page import PageMargins
-from openpyxl.styles import PatternFill
+from openpyxl.styles import PatternFill, Alignment
 
 try:
     import rarfile
@@ -566,11 +567,62 @@ def auto_fit_print_area_improved(ws):
         return False
 
 
+def wrap_footnote_rows(ws):
+    """
+    Строки-примечания под таблицей (одна длинная ячейка без границ, напр. «Данные не размещаются...»)
+    вылезают вправо за таблицу и ломают расчёт ширины -> лишняя страница.
+    Объединяем такую строку на всю ширину таблицы, включаем перенос по словам и подбираем высоту.
+    """
+    try:
+        last_col = ws.max_column
+        if last_col < 2:
+            return False
+        # последняя строка таблицы = последняя строка с границами
+        table_last_row = 0
+        for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=last_col):
+            for cell in row:
+                b = cell.border
+                if b and any(side is not None and side.style for side in (b.top, b.bottom, b.left, b.right)):
+                    table_last_row = cell.row
+                    break
+        if table_last_row == 0:
+            return False
+        total_width = 0.0
+        for ci in range(1, last_col + 1):
+            dim = ws.column_dimensions.get(get_column_letter(ci))
+            total_width += dim.width if (dim and dim.width) else 8.43
+        changed = False
+        for r in range(table_last_row + 1, ws.max_row + 1):
+            filled = [c for c in ws[r][:last_col] if c.value is not None and str(c.value).strip()]
+            if len(filled) != 1 or not isinstance(filled[0].value, str):
+                continue
+            cell = filled[0]
+            if any(cell.coordinate in rng for rng in ws.merged_cells.ranges):
+                continue
+            if cell.column >= last_col:
+                continue
+            width = sum((ws.column_dimensions.get(get_column_letter(ci)).width
+                         if ws.column_dimensions.get(get_column_letter(ci)) and ws.column_dimensions.get(get_column_letter(ci)).width
+                         else 8.43) for ci in range(cell.column, last_col + 1))
+            ws.merge_cells(start_row=r, start_column=cell.column, end_row=r, end_column=last_col)
+            cell.alignment = Alignment(wrap_text=True, vertical='top', horizontal='left')
+            font_size = (cell.font.sz if cell.font and cell.font.sz else 11)
+            lines = max(1, math.ceil(len(cell.value) * 1.1 / width))
+            ws.row_dimensions[r].height = lines * font_size * 1.25 + 3
+            logger.info(f"[{ws.title}] Примечание в строке {r} объединено и перенесено по словам ({lines} стр.)")
+            changed = True
+        return changed
+    except Exception as e:
+        logger.warning(f"[{ws.title}] Ошибка переноса примечания: {e}")
+        return False
+
+
 def aggressive_clean_empty_regions(ws):
     try:
         last_real_row = 1
         last_real_col = 1
-        for merged_range in ws.merged_cells.ranges:
+        # list(...) — копия, т.к. unmerge_cells меняет множество во время перебора
+        for merged_range in list(ws.merged_cells.ranges):
             master_cell = ws.cell(merged_range.min_row, merged_range.min_col)
             if master_cell.value is None:
                 try:
@@ -858,6 +910,7 @@ def process_excel_file(file_path, log_func=None, excel_app=None):
                     if safe_add_page_number(ws):
                         logger.info(f"[{ws.title}] Добавлен номер страницы")
                     aggressive_clean_empty_regions(ws)
+                    wrap_footnote_rows(ws)
                     auto_fit_print_area_improved(ws)
 
 
