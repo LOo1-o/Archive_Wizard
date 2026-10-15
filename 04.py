@@ -1,0 +1,566 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# Рабочий код, проблема с масштабом
+import logging
+import os
+import time
+import tkinter as tk
+import traceback
+from tkinter import filedialog, messagebox, ttk
+from pathlib import Path
+import pythoncom
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+import re
+import win32com.client as win32
+from openpyxl.worksheet.page import PageMargins
+
+# Настройка логгера
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Константы для формата бумаги A4 в дюймах
+PAGE_WIDTH_A4_PORTRAIT = 8.27  # Ширина A4 в дюймах (портрет)
+PAGE_HEIGHT_A4_PORTRAIT = 11.69  # Высота A4 в дюймах (портрет)
+
+# Коэффициент пересчета ширины столбца Excel (в символах) в дюймы
+# Согласно документации Microsoft, 1 дюйм = 13 символов для ширины столбца [2]
+EXCEL_CHAR_TO_INCH = 1 / 13
+
+# Высота строки в пунктах, 1 дюйм = 72 пункта [2]
+EXCEL_POINT_TO_INCH = 1 / 72
+
+# Множитель для длины символа, чтобы получить ширину столбца в единицах Excel (приблизительно) [3]
+# Это эвристика, так как точное преобразование зависит от шрифта и других факторов.
+CHAR_WIDTH_MULTIPLIER = 1.23
+
+# Для компенсации разницы между теоретической расчётной шириной и реальной шириной отображения в Excel
+CALIBRATION_FACTOR = 1.02
+
+MAX_FILES_TO_PROCESS = 1000
+
+
+def find_header_rows(ws, first_data_row=1):
+    """Находит строки заголовков таблицы"""
+    try:
+        # 2. Поиск маркера в видимых и скрытых строках
+        marker_row = None
+        for col in [1, 2]:
+            for row in range(first_data_row, min(first_data_row + 20, ws.max_row + 1)):
+                cell = ws.cell(row=row, column=col)
+                cell_value = cell.value
+                cell_str = str(cell_value).strip().lower() if cell_value else ""
+
+                # Проверка маркеров
+                if cell_str in ['a', 'b', 'c', 'а', 'б', 'п/п', '№']:
+                    marker_row = row
+                    break
+                elif re.fullmatch(r'^[123]$', cell_str):
+                    marker_row = row
+                    break
+            if marker_row is not None:
+                break
+
+        if marker_row is None:
+            marker_row = first_data_row
+            print(f"Маркер не найден, используется первая строка с данными: {marker_row}")
+            return marker_row, marker_row
+
+        # 3. Поднимаемся от строки над маркером и ищем строки с верхней границей
+        header_block = [marker_row]  # Включаем строку с маркером
+        current_row = marker_row - 1
+
+        while current_row >= 1:
+            has_right_border = False
+            for col in range(1, min(10, ws.max_column + 1)):
+                cell = ws.cell(row=current_row, column=col)
+                if cell.border.right.style:
+                    has_right_border = True
+                    break
+
+            # Если строка имеет правую границу, добавляем ее в блок
+            if has_right_border:
+                header_block.append(current_row)
+                current_row -= 1
+            else:
+                # Если правая граница отсутствует, это конец блока заголовков
+                break
+
+        # 4. Определяем диапазон
+        start_row = min(header_block)
+        end_row = max(header_block)
+        ws.print_title_cols = "A:A"  # Сквозной столбец A
+        logger.info(f"Сквозные строки: {start_row}-{end_row}" + " + Сквозной столбец A")
+        return start_row, end_row
+
+    except Exception as eo:
+        logger.error(f"Ошибка поиска заголовков: {eo}")
+        return 1, 1
+
+
+def safe_add_page_number(ws):
+    """Безопасно добавляет номер страницы в верхний колонтитул"""
+    try:
+        # Проверяем, уже ли есть номер страницы в верхнем колонтитуле
+        if ws.oddHeader.center and "&P" in getattr(ws.oddHeader.center, 'text', ''):
+            return False
+
+        # Устанавливаем текст в центральную часть верхнего колонтитула
+        ws.oddHeader.center.text = "Страница &P из &N"
+        ws.evenHeader.center.text = "Страница &P из &N"
+
+        return True
+    except Exception as eq:
+        print(f"Ошибка добавления номера страницы: {eq}")
+        return False
+
+
+def create_excel_instance():
+    """
+    Создаёт новый независимый экземпляр Excel.
+    Используем DispatchEx, чтобы гарантировать отдельный процесс,
+    который не мешает другим открытым файлам пользователя.
+    """
+    excel = win32.DispatchEx("Excel.Application")  # ← отдельный процесс Excel
+    excel.Visible = False  # Не показываем Excel пользователю во время обработки
+    return excel
+
+
+def process_excel_file(file_path, log_func=None):
+    """Обработка Excel: поиск сквозных строк (openpyxl) + установка в Win32 + порядок страниц"""
+
+    temp_xlsx = None
+    excel = None
+    wb = None
+    header_rows_map = {}  # {имя_листа: (start_row, end_row)}
+    original_row_heights = {}  # NEW: сохраняем оригинальные высоты строк {sheet_name: {row_num: height}}
+
+    try:
+        file_path = str(file_path)
+        original_path_for_modified = Path(file_path)
+        if not os.path.exists(file_path):
+            logger.info(f"Файл не существует: {file_path}")
+            return False
+
+        # Конвертация .xls → .xlsx
+        if file_path.lower().endswith('.xls'):
+            temp_xlsx = file_path + 'x'
+            try:
+                logger.info(f"Конвертируем {file_path} -> {temp_xlsx}")
+                excel = create_excel_instance()
+                excel.Visible = False
+                excel.DisplayAlerts = False
+                wb_com = excel.Workbooks.Open(file_path)
+
+                # NEW: Сохраняем высоты строк из .xls файла
+                for ws in wb_com.Sheets:
+                    original_row_heights[ws.Name] = {}
+                    for row_idx in range(1, ws.UsedRange.Rows.Count + 1):
+                        if not ws.Rows(row_idx).Hidden:
+                            original_row_heights[ws.Name][row_idx] = ws.Rows(row_idx).RowHeight
+
+                wb_com.SaveAs(temp_xlsx, FileFormat=51)  # .xlsx
+                wb_com.Close()
+                excel.Quit()
+                excel = None
+                file_path_for_openpyxl = temp_xlsx
+            except (pythoncom.com_error, AttributeError, PermissionError) as es:
+                logger.info(f"Ошибка конвертации: {es}")
+                if excel:
+                    try:
+                        excel.Quit()
+                    except:
+                        pass
+                if temp_xlsx and os.path.exists(temp_xlsx):
+                    try:
+                        os.remove(temp_xlsx)
+                    except:
+                        pass
+                return False
+        else:
+            file_path_for_openpyxl = file_path
+
+        # Загрузка книги (openpyxl) и определение сквозных строк
+        try:
+            wb = load_workbook(filename=file_path_for_openpyxl, read_only=False, keep_vba=False)
+
+            # NEW: Для .xlsx файлов сохраняем высоты строк из openpyxl
+            if not original_row_heights:  # если еще не сохранили из .xls
+                for ws in wb.worksheets:
+                    original_row_heights[ws.title] = {}
+                    for row_idx, row_dim in ws.row_dimensions.items():
+                        if row_dim.height is not None:
+                            original_row_heights[ws.title][row_idx] = row_dim.height
+                        else:
+                            # Стандартная высота для строк без явного задания
+                            original_row_heights[ws.title][row_idx] = 15.0
+
+                    logger.info(f"[{ws.title}] Сохранено {len(original_row_heights[ws.title])} высот строк")
+
+        except Exception as ec:
+            logger.info(f"Ошибка загрузки: {ec}")
+            return False
+
+        # Обработка каждого листа
+        for ws in wb.worksheets:
+            try:
+                if ws.max_row == 1 and ws.max_column == 1:
+                    continue
+
+                start_row, end_row = find_header_rows(ws)
+                header_rows_map[ws.title] = (start_row, end_row)  # сохраняем для Win32
+                ws.print_title_rows = f"{start_row}:{end_row}"
+                ws.print_title_cols = "A:A"
+                logger.info(f"[{ws.title}] Найдены сквозные строки: {start_row}-{end_row}")
+
+                if safe_add_page_number(ws):
+                    logger.info(f"[{ws.title}] Добавлен номер страницы")
+
+                if set_orientation_and_scale(ws):
+                    logger.info(f"[{ws.title}] Установлена ориентация и масштаб")
+            except Exception as ev:
+                logger.info(f"Ошибка обработки листа {ws.title}: {ev}")
+                continue
+
+        # Сохраняем промежуточный результат
+        modified_path = get_modified_path(original_path_for_modified,
+                                          os.path.dirname(original_path_for_modified)).with_suffix('.xlsx')
+        modified_path.parent.mkdir(parents=True, exist_ok=True)
+        wb.save(str(modified_path))
+        logger.info(f"Сохранено как .xlsx: {modified_path}")
+
+        # Win32 — установка сквозных строк + порядок печати + ВОССТАНОВЛЕНИЕ ВЫСОТ
+        try:
+            excel = win32.DispatchEx("Excel.Application")
+            excel.Visible = False
+            excel.DisplayAlerts = False
+            wb_com = excel.Workbooks.Open(str(modified_path))
+
+            for ws in wb_com.Sheets:
+                try:
+                    if ws.Name in header_rows_map:
+                        start_row, end_row = header_rows_map[ws.Name]
+                        ws.PageSetup.PrintTitleRows = f"${start_row}:${end_row}"
+                        ws.PageSetup.PrintTitleColumns = "$A:$A"
+                        logger.info(f"[{ws.Name}] Сквозные строки установлены в Win32")
+
+                    ws.PageSetup.Order = 2  # вправо, затем вниз
+                    logger.info(f"[{ws.Name}] Порядок страниц установлен (Win32)")
+                except Exception as ews:
+                    logger.info(f"[{ws.Name}] Ошибка Win32 настроек: {ews}")
+
+            wb_com.Save()
+            wb_com.Close()
+
+        except Exception as ewin:
+            logger.info(f"Win32COM ошибка: {ewin}")
+        finally:
+            if excel:
+                try:
+                    excel.Quit()
+                except:
+                    pass
+
+        return True
+
+    finally:
+        if wb:
+            try:
+                wb.close()
+            except:
+                pass
+        if temp_xlsx and os.path.exists(temp_xlsx):
+            try:
+                os.remove(temp_xlsx)
+                logger.info(f"Удалён временный файл: {temp_xlsx}")
+            except PermissionError as ep:
+                logger.info(f"Не удалось удалить временный файл: {ep}")
+            except FileNotFoundError:
+                pass
+            except OSError as es:
+                logger.info(f"Не удалось удалить временный файл: {es}")
+
+
+def set_orientation_and_scale(ws):
+    """
+    Устанавливает ориентацию страницы и масштаб печати в зависимости от ширины таблицы.
+    Логика:
+      - Сначала пробуем портретную ориентацию с масштабированием от 100% до 60%
+      - Если не помещается - пробуем альбомную с масштабированием от 100% до 60%
+      - Если всё равно не помещается - форсируем альбомную ориентацию
+    """
+    try:
+        # Рассчитываем размеры таблицы
+        total_width, total_height = calculate_table_dimensions(ws)
+        logger.info(f"[{ws.title}] Физические размеры таблицы: {total_width:.2f}x{total_height:.2f} дюймов")
+
+        # В функции set_orientation_and_scale, после расчета total_width, total_height
+        if total_width == 0 or total_height == 0:
+            logger.warning(f"[{ws.title}] Не удалось рассчитать размеры таблицы, используются значения по умолчанию")
+            ws.page_setup.orientation = ws.ORIENTATION_PORTRAIT
+            ws.page_setup.scale = 100
+            return True
+
+        # Устанавливаем формат A4
+        ws.page_setup.paperSize = ws.PAPERSIZE_A4
+
+        # Настройка полей страницы
+        margins = PageMargins(
+            left=0.25, right=0.25,
+            top=0.5, bottom=0.25,
+            header=0.25, footer=0.25
+        )
+        ws.page_margins = margins
+
+        # Рассчитываем доступную область печати
+        available_width_portrait = PAGE_WIDTH_A4_PORTRAIT - margins.left - margins.right
+        available_width_landscape = PAGE_HEIGHT_A4_PORTRAIT - margins.left - margins.right
+
+        # 1. Проверяем портретную ориентацию с возможностью масштабирования 100% → 60%
+        portrait_scale = None
+        for scale in range(100, 59, -1):  # Проверяем масштабы от 100% до 60%
+            scaled_width = total_width * (scale / 100.0)
+            if scaled_width <= available_width_portrait:
+                portrait_scale = scale
+                break
+
+        # 2. Если нашли подходящий масштаб для портрета - применяем
+        if portrait_scale is not None:
+            ws.page_setup.orientation = ws.ORIENTATION_PORTRAIT
+            ws.page_setup.scale = portrait_scale
+            logger.info(f"[{ws.title}] Портрет: масштаб {portrait_scale}%")
+            return True
+
+        # 3. Проверяем альбомную ориентацию с возможностью масштабирования 100% → 60%
+        landscape_scale = None
+        for scale in range(100, 59, -1):  # Проверяем масштабы от 100% до 60%
+            scaled_width = total_width * (scale / 100.0)
+            if scaled_width <= available_width_landscape:
+                landscape_scale = scale
+                break
+
+        # 4. Если нашли подходящий масштаб для альбома - применяем
+        if landscape_scale is not None:
+            ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+            ws.page_setup.scale = landscape_scale
+            logger.info(f"[{ws.title}] Альбомная: масштаб {landscape_scale}%")
+            return True
+
+        # 5. Если не помещается даже при 60% - форсируем альбомную ориентацию
+        ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+        ws.page_setup.scale = 60
+        logger.info(f"[{ws.title}] Форсированная альбомная (масштаб 60%)")
+        return True
+
+    except Exception as e:
+        logger.error(f"Ошибка установки ориентации/масштаба: {e}")
+        return False
+
+
+def calculate_table_dimensions(ws):
+    """Рассчитывает размеры таблицы в дюймах с учётом реального отображения"""
+    try:
+        # Определяем последний непустой столбец
+        max_col = 1
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.value is not None:
+                    max_col = max(max_col, cell.column)
+
+        # Получаем стандартные размеры (убераем +1, так как теперь используем CALIBRATION_FACTOR)
+        default_col_width = getattr(ws.sheet_format, 'defaultColWidth', 8.43)  # ← убрали +1
+        default_row_height = getattr(ws.sheet_format, 'defaultRowHeight', 15.0)
+
+        # Рассчитываем ширину таблицы в дюймах
+        total_width_inches = 0.0
+        for col_idx in range(1, max_col + 1):
+            col_letter = get_column_letter(col_idx)
+            col_dim = ws.column_dimensions.get(col_letter)
+
+            if col_dim and col_dim.hidden:
+                continue
+
+            if col_dim and col_dim.width is not None:
+                # Используем калибровочный коэффициент вместо +1
+                width_in_pixels = col_dim.width * 7 * CALIBRATION_FACTOR + 5
+                width_in_inches = width_in_pixels / 96
+            else:
+                # Используем калибровочный коэффициент для столбцов по умолчанию
+                width_in_pixels = default_col_width * 7 * CALIBRATION_FACTOR + 5
+                width_in_inches = width_in_pixels / 96
+
+            total_width_inches += width_in_inches
+
+        # Рассчитываем высоту таблицы (высота не требует калибровки)
+        total_height_points = 0.0
+        for row_idx in range(1, ws.max_row + 1):
+            row_dim = ws.row_dimensions.get(row_idx)
+
+            if row_dim and row_dim.hidden:
+                continue
+
+            if row_dim and row_dim.height is not None:
+                height_points = row_dim.height
+            else:
+                height_points = default_row_height
+
+            total_height_points += height_points
+
+        total_height_inches = total_height_points * EXCEL_POINT_TO_INCH
+
+        logger.info(f"[{ws.title}] Рассчитанные размеры: {total_width_inches:.2f} x {total_height_inches:.2f} дюймов")
+        return total_width_inches, total_height_inches
+
+    except Exception as e:
+        logger.error(f"Ошибка расчёта размеров таблицы: {e}")
+        return 0, 0
+
+
+class ExcelProcessor:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.folder_path = tk.StringVar()
+        self.progress_var = tk.DoubleVar()
+        self.status_var = tk.StringVar(value="Готово")
+        self.log_messages = []
+
+        self.progress_bar = None  # ← объявляем атрибут заранее
+        self.setup_ui()
+
+    def setup_ui(self):
+        self.root.deiconify()
+        self.root.title("Wizard Archive")
+        self.root.geometry("600x400")
+        main_frame = ttk.Frame(self.root, padding="20")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(main_frame, text="Wizard Archive", font=('Helvetica', 14, 'bold')).pack(pady=10)
+        ttk.Label(main_frame, text="Папка с файлами:").pack(anchor="w")
+        ttk.Entry(main_frame, textvariable=self.folder_path, width=50).pack(fill="x", pady=5)
+        ttk.Button(main_frame, text="Обзор", command=self.select_folder).pack(pady=5)
+        ttk.Button(main_frame, text="Старт", command=self.start_processing).pack(pady=20)
+
+        self.progress_bar = ttk.Progressbar(main_frame, variable=self.progress_var, maximum=100)  # ← теперь норм
+        self.progress_bar.pack(fill="x")
+        ttk.Label(main_frame, textvariable=self.status_var).pack()
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def log_message(self, message):
+        print(message)
+        self.log_messages.append(message)
+
+    def select_folder(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            self.folder_path.set(folder)
+
+    def start_processing(self):
+        folder = self.folder_path.get()
+        if not folder:
+            messagebox.showerror("Ошибка", "Сначала выберите папку!")
+            return
+        if not os.path.exists(folder):
+            messagebox.showerror("Ошибка", "Папка не найдена!")
+            return
+
+        import threading
+        threading.Thread(target=self.process_files_thread, args=(folder,), daemon=True).start()
+
+    def process_files_thread(self, root_folder):
+        try:
+            pythoncom.CoInitialize()
+            self.status_var.set("Подготовка...")
+            self.root.update()
+
+            success_count = 0
+            error_count = 0
+            error_log = []
+
+            files = list(Path(root_folder).rglob("*.xls")) + list(Path(root_folder).rglob("*.xlsx"))
+            files = [f for f in files if "modified" not in str(f).lower() and not f.name.startswith('~$')]
+            total_files = min(len(files), MAX_FILES_TO_PROCESS)
+
+            if total_files == 0:
+                self.status_var.set("Файлы для обработки не найдены.")
+                messagebox.showinfo("Завершено", "В выбранной папке и ее подпапка не найдено файлов .xls или .xlsx.")
+                return
+
+            for i, file in enumerate(files):
+                if not file.is_file():
+                    continue
+
+                self.status_var.set(f"Обработка {file.name}...")
+                self.progress_var.set(((i + 1) / total_files) * 100)
+                self.root.update()
+
+                start_time = time.time()
+                result = process_excel_file(str(file), log_func=lambda msg: print(f"[{file.name}] {msg}"))
+                elapsed = time.time() - start_time
+
+                if result:
+                    success_count += 1
+                    print(f"[{file.name}] ✅ Обработан за {elapsed:.2f} секунд")
+                else:
+                    error_count += 1
+                    error_log.append(str(file))
+                    print(f"[{file.name}] ❌ Ошибка за {elapsed:.2f} секунд")
+
+            if error_log:
+                log_dir = Path(root_folder) / "modified" / "logs"
+                log_dir.mkdir(parents=True, exist_ok=True)
+                log_file = log_dir / "error_log.txt"
+                with open(log_file, 'w', encoding='utf-8') as f:
+                    f.write("Файлы, при обработке которых произошли ошибки:\n")
+                    f.write("\n".join(error_log))
+
+            messagebox.showinfo("Завершено", f"Успешно: {success_count}, Ошибки: {error_count}")
+
+        except Exception as ex:
+            messagebox.showerror("Критическая ошибка", f"Процесс прерван:\n{str(ex)}")
+            traceback.print_exc()
+        finally:
+            self.status_var.set("Готово")
+            self.progress_var.set(0)
+            try:
+                pythoncom.CoUninitialize()
+            except:
+                pass
+
+    def on_close(self):
+        if messagebox.askokcancel("Выход", "Вы действительно хотите выйти?"):
+            self.root.destroy()
+
+    def run(self):
+        self.root.mainloop()
+
+
+def get_modified_path(original_path, root_folder):
+    """Сохраняет структуру папок в modified/"""
+    original_path = Path(original_path)
+    root_folder = Path(root_folder)
+    try:
+        # Убедимся, что root_folder является предком original_path
+        if root_folder not in original_path.parents:
+            rel_path = Path(original_path.name)
+        else:
+            rel_path = original_path.relative_to(root_folder)
+    except ValueError:
+        rel_path = Path(original_path.name)
+
+    # Путь к корневой папке для сохwidth_in_inches = col_dim.width * 0.14ранения - это родительская папка исходного файла
+    output_root = original_path.parent
+    return output_root / "modified" / rel_path
+
+
+if __name__ == "__main__":
+    try:
+        app = ExcelProcessor()
+        app.run()
+    except KeyboardInterrupt:
+        print("Остановка по инициативе пользователя.")
+    except Exception as e:
+        print(f"Произошла непредвиденная ошибка: {e}")
+        traceback.print_exc()
+
