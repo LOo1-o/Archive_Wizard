@@ -567,6 +567,52 @@ def auto_fit_print_area_improved(ws):
         return False
 
 
+def read_auto_height_rows(xlsx_path):
+    """
+    {имя листа: set(номеров строк)}, у которых в исходном файле высота подбирается Excel автоматически
+    (есть ht, но нет customHeight). openpyxl при сохранении ставит customHeight=1 всем строкам с ht,
+    из-за чего перенесённый по словам текст обрезается — эти строки нужно вернуть в автоподбор.
+    """
+    result = {}
+    try:
+        import xml.etree.ElementTree as ET
+        ns_main = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+        ns_rel = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+        with zipfile.ZipFile(xlsx_path) as z:
+            wb_xml = ET.fromstring(z.read("xl/workbook.xml"))
+            rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+            targets = {r.get("Id"): r.get("Target") for r in rels}
+            for sh in wb_xml.iter(ns_main + "sheet"):
+                target = targets.get(sh.get(ns_rel + "id"))
+                if not target:
+                    continue
+                target = target.lstrip("/")
+                path = target if target.startswith("xl/") else "xl/" + target
+                rows = set()
+                for _, el in ET.iterparse(z.open(path), events=("end",)):
+                    if el.tag == ns_main + "row":
+                        if el.get("ht") is not None and el.get("customHeight") not in ("1", "true"):
+                            rows.add(int(el.get("r")))
+                        el.clear()
+                result[sh.get("name")] = rows
+    except Exception as e:
+        logger.warning(f"Не удалось определить строки с автовысотой: {e}")
+    return result
+
+
+def restore_auto_row_heights(ws, auto_rows):
+    """Снимает фиксированную высоту со строк, которые в исходнике были с автоподбором высоты."""
+    count = 0
+    for r in auto_rows or ():
+        dim = ws.row_dimensions.get(r)
+        if dim is not None and dim.height is not None:
+            dim.height = None
+            count += 1
+    if count:
+        logger.info(f"[{ws.title}] Возвращена автовысота строк: {count}")
+    return count
+
+
 def wrap_footnote_rows(ws):
     """
     Строки-примечания под таблицей (одна длинная ячейка без границ, напр. «Данные не размещаются...»)
@@ -886,6 +932,7 @@ def process_excel_file(file_path, log_func=None, excel_app=None):
             file_path_for_openpyxl = file_path
         # === OPENPYXL ОБРАБОТКА ===
         try:
+            auto_height_rows = read_auto_height_rows(file_path_for_openpyxl)
             wb = load_workbook(filename=file_path_for_openpyxl, read_only=False, keep_vba=False)
             cleanup_old_print_settings(wb)
             hard_clear_fills_only(wb)
@@ -910,6 +957,7 @@ def process_excel_file(file_path, log_func=None, excel_app=None):
                     if safe_add_page_number(ws):
                         logger.info(f"[{ws.title}] Добавлен номер страницы")
                     aggressive_clean_empty_regions(ws)
+                    restore_auto_row_heights(ws, auto_height_rows.get(ws.title))
                     wrap_footnote_rows(ws)
                     auto_fit_print_area_improved(ws)
 
